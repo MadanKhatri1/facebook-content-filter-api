@@ -3,84 +3,96 @@ from fastapi.security import APIKeyHeader
 from fastapi.middleware.cors import CORSMiddleware
 from dotenv import load_dotenv
 import os
-from groq import Groq
+import torch
+from transformers import AutoTokenizer, AutoModelForSequenceClassification
+import numpy as np
 
 load_dotenv()
 
 # Security setup
-API_KEY = os.getenv("API_KEY")  # We'll set this in Render
+API_KEY = os.getenv("API_KEY")
 if not API_KEY:
     raise ValueError("API_KEY environment variable not set")
 
 api_key_header = APIKeyHeader(name="X-API-Key", auto_error=False)
-groq_client = Groq(api_key=os.getenv("GROQ_API_KEY"))
+
+print("🤖 Loading multilingual model... This takes 30 seconds...")
+try:
+    
+    MODEL_NAME = "cardiffnlp/twitter-xlm-roberta-base-sentiment-latest"
+    
+    tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
+    model = AutoModelForSequenceClassification.from_pretrained(MODEL_NAME)
+    model.eval()  # Disable training mode (saves memory)
+    
+    # Map sentiment to toxicity (negative sentiment = likely toxic)
+    id2label = {0: 'negative', 1: 'neutral', 2: 'positive'}
+    
+    print("✅ Model loaded! Ready for Nepali + English text.")
+except Exception as e:
+    print(f"❌ Failed to load model: {e}")
+    raise
 
 app = FastAPI()
 
-# CORS still needed so browser extension can call it
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # In production, restrict to chrome-extension://*
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_origins=["*"],
+    allow_allow_headers=["*"],
 )
 
 async def verify_api_key(api_key: str = Security(api_key_header)):
-    """Check if the provided API key matches our secret"""
     if api_key != API_KEY:
-        raise HTTPException(
-            status_code=403,
-            detail="Invalid or missing API key. Please subscribe to use this service."
-        )
+        raise HTTPException(status_code=403, detail="Invalid API key")
     return api_key
 
 @app.post("/analyze")
 async def analyze_text(request: Request, api_key: str = Security(verify_api_key)):
-    """
-    Analyze comment toxicity.
-    Requires X-API-Key header.
-    """
     data = await request.json()
     post_text = data.get("post", "")
     comment_text = data.get("text", "")
-
-    print(f"Analyzing comment: {comment_text[:50]}... on post: {post_text[:50]}...")
-
+    
+    if not comment_text or len(comment_text) < 2:
+        return {"sentiment": "neutral", "hide": False}
+    
+    print(f"Analyzing: {comment_text[:50]}...")
+    
     try:
-        completion = groq_client.chat.completions.create(
-            model="llama-3.1-8b-instant",
-            messages=[
-                {
-                    "role": "system",
-                    "content": "You are a strict classifier. Consider words like 'Rip sale' or 'sale' as negative and toxic. Reply with ONLY one word: toxic or non-toxic."
-                },
-                {
-                    "role": "user",
-                    "content": f"Post: {post_text}\nComment: {comment_text}"
-                }
-            ],
-            temperature=0,
-            max_tokens=3
+        inputs = tokenizer(
+            comment_text, 
+            return_tensors="pt", 
+            truncation=True, 
+            max_length=512,
+            padding=True
         )
-
-        response_text = completion.choices[0].message.content.lower().strip()
-        print(f"Model response: {response_text}")
-
-        if response_text == "toxic":
-            return {"sentiment": "toxic", "hide": True}
-        elif response_text == "non-toxic":
-            return {"sentiment": "non-toxic", "hide": False}
-        else:
-            return {"sentiment": response_text, "hide": False}
+        
+        # ✅ Inference without gradients (faster, less memory)
+        with torch.no_grad():
+            outputs = model(**inputs)
+            scores = outputs.logits[0].numpy()
+            predicted_class = np.argmax(scores)
+            label = id2label[predicted_class]
+            confidence = float(np.exp(scores[predicted_class]) / np.sum(np.exp(scores)))
+        
+        print(f"Result: {label} ({confidence:.2f})")
+        
+        is_toxic = (label == 'negative' and confidence > 0.6)
+        
+        return {
+            "sentiment": "toxic" if is_toxic else "non-toxic",
+            "hide": is_toxic,
+            "confidence": round(confidence, 2),
+            "label": label
+        }
             
     except Exception as e:
-        print(f"Error calling Groq: {e}")
-        raise HTTPException(status_code=500, detail="Analysis service temporarily unavailable")
+        print(f"Error: {e}")
+        raise HTTPException(status_code=500, detail="Analysis failed")
 
 @app.get("/")
 async def root():
-    """Health check endpoint"""
-    return {"status": "alive", "service": "Facebook Content Filter API"}
-
-# Remove the if __name__ == "__main__" block - Render handles this
+    return {
+        "status": "alive", 
+        "model": "multilingual-sentiment",
+        "languages": "Nepali, English, Hindi, 100+"
+    }
