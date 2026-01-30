@@ -1,5 +1,6 @@
 fastapi
 uvicorn
-groq
 python-dotenv
+torch
 transformers
+numpy
