@@ -1,6 +1,5 @@
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
-from huggingface_hub import InferenceClient
 from dotenv import load_dotenv
 import os
 from groq import Groq
