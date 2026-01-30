@@ -1,6 +1,4 @@
 fastapi
 uvicorn
 python-dotenv
-torch
-transformers
 numpy
